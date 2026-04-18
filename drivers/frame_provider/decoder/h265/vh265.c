@@ -4510,14 +4510,19 @@ static void stream_mode_fill_vf_pts(
 	 */
 	if (!vdec->master)
 	{
-		// legacy DV/stream lookup path
+		// legacy DV/stream lookup path — use pic->stream_offset, matching
+		// pre-refactor behavior.  cpm's refactor substituted
+		// hevc->shift_byte_count_lo (the global bytes-processed counter)
+		// for the per-pic stream_offset, which returns the pts of whatever
+		// frame the counter is currently at rather than the pic being
+		// output.  For standalone vdecs without a marker (ST-DL FEL in MKV,
+		// non-DV HEVC in stream mode) this produces a zigzag of unrelated
+		// pts values that breaks AV sync.
 		hevc_print(hevc, H265_DEBUG_OUT_PTS,
-			"call pts_lookup_offset_us64(0x%x)\n", hevc->shift_byte_count_lo);
+			"call pts_lookup_offset_us64(0x%x)\n", pic->stream_offset);
 		if ((vdec->vbuf.no_parser == 0) || (vdec->vbuf.use_ptsserv)) {
-			u32 offset = hevc->shift_byte_count_lo;
-			offset = (offset > 4) ? (offset - 4) : offset;
-
-			if (pts_lookup_offset_us64(PTS_TYPE_VIDEO, offset, &vf->pts, frame_size,
+			if (pts_lookup_offset_us64(PTS_TYPE_VIDEO, pic->stream_offset,
+						  &vf->pts, frame_size,
 						  0, &vf->pts_us64) != 0) {
 				vf->pts = 0;
 				vf->pts_us64 = 0;

@@ -4500,7 +4500,15 @@ static void stream_mode_fill_vf_pts(
 		return;
 	}
 
-	if (vdec->slave)
+	/* Use ptsserv lookup when this vdec is NOT the slave of a dual-decoder
+	 * pair — i.e. when it's either the master (DT-DL BL decoder) OR a
+	 * standalone single vdec (ST-DL FEL in MKV, non-DV HEVC in stream
+	 * mode). The original pre-refactor condition was `vdec->master == NULL`;
+	 * cpm's refactor used `vdec->slave` which only covers the master-of-dual
+	 * case and breaks the standalone-vdec case — vf->pts ended up at 0 on
+	 * every frame, causing massive skipping and A/V desync on ST-DL FEL.
+	 */
+	if (!vdec->master)
 	{
 		// legacy DV/stream lookup path
 		hevc_print(hevc, H265_DEBUG_OUT_PTS,

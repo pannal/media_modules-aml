@@ -354,10 +354,20 @@ static struct clk_set_setting clks_for_formats[] = {
 				}
 		},
 	{			/*[VFORMAT_VC1] */
-			{{1280 * 720 * 30, 100}, {1920 * 1080 * 30, 166},
-				{1920 * 1080 * 60, 333},
-				{4096 * 2048 * 30, 600}, {4096 * 2048 * 60,
-						600}, {INT_MAX, 600},
+			/*
+			 * 1080p24 needs 333MHz, not 166. The tiers are keyed on
+			 * pixel rate alone, so a 40Mbit remux and a 10Mbit encode
+			 * of the same size and rate are clocked identically, and
+			 * on high bitrate VC-1 the busy frames do not finish in
+			 * time: 200-275KB packets against a 59KB median measured
+			 * 280-430ms of decode against a 41.7ms budget, stalling
+			 * at the same timestamps on every playback. H264 carries
+			 * the same tightened tier for the same reason.
+			 */
+			{{1280 * 720 * 30, 100}, {1920 * 1080 * 21, 166},
+				{1920 * 1080 * 30, 333},
+				{1920 * 1080 * 60, 600},
+				{4096 * 2048 * 60, 600}, {INT_MAX, 600},
 				}
 		},
 	{			/*[VFORMAT_AVS] */

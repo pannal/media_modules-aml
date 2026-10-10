@@ -136,6 +136,7 @@ static unsigned int decode_timeout_val = 200;
 #define DEC_CONTROL_FLAG_FORCE_2500_704_576_INTERLACE  0x0008
 #define DEC_CONTROL_FLAG_FORCE_2500_544_576_INTERLACE  0x0010
 #define DEC_CONTROL_FLAG_FORCE_2500_480_576_INTERLACE  0x0020
+#define DEC_CONTROL_FLAG_KEEP_PROG_FRAME               0x0040
 #define DEC_CONTROL_INTERNAL_MASK                      0x0fff
 #define DEC_CONTROL_FLAG_FORCE_SEQ_INTERLACE           0x1000
 
@@ -208,6 +209,8 @@ struct mmpeg2_userdata_info_t {
 
 struct pic_info_t {
 	u32 buffer_info;
+	u32 seqinfo;
+	u32 frame_dur;
 	u32 index;
 	u32 offset;
 	u32 width;
@@ -220,6 +223,8 @@ struct pic_info_t {
 	u32 frame_size; // For frame base mode
 };
 
+#include "mpeg12_keep_prog.h"
+
 struct vdec_mpeg12_hw_s {
 	spinlock_t lock;
 	struct platform_device *platform_dev;
@@ -231,6 +236,7 @@ struct vdec_mpeg12_hw_s {
 	u32 frame_width;
 	u32 frame_height;
 	u32 frame_dur;
+	struct mpeg12_keep_prog keep_prog;
 	u32 frame_prog;
 	u32 seqinfo;
 	u32 ctx_valid;
@@ -1604,6 +1610,9 @@ static inline void hw_update_gvs(struct vdec_mpeg12_hw_s *hw)
 
 }
 
+static u32 force_interlace_picture(u32 control, u32 width, u32 height,
+	u32 duration, u32 progressive);
+
 static int prepare_display_buf(struct vdec_mpeg12_hw_s *hw,
 	struct pic_info_t *pic)
 {
@@ -1612,6 +1621,9 @@ static int prepare_display_buf(struct vdec_mpeg12_hw_s *hw,
 	struct vframe_s *vf = NULL;
 	u32 index = pic->index;
 	u32 info = pic->buffer_info;
+	u32 frame_prog = hw->frame_prog;
+	u32 film_duration = 0;
+	struct mpeg12_keep_prog next_cadence = hw->keep_prog;
 	struct vdec_s *vdec = hw_to_vdec(hw);
 	struct aml_vcodec_ctx * v4l2_ctx = hw->v4l2_ctx;
 	ulong nv_order = VIDTYPE_VIU_NV21;
@@ -1633,13 +1645,24 @@ static int prepare_display_buf(struct vdec_mpeg12_hw_s *hw,
 
 	user_data_ready_notify(hw, pic->pts, pic->pts_valid);
 
-	if (hw->frame_prog & PICINFO_PROG) {
+	if (hw->dec_control & DEC_CONTROL_FLAG_KEEP_PROG_FRAME) {
+		frame_prog = force_interlace_picture(hw->dec_control, pic->width,
+			pic->height, pic->frame_dur, info & PICINFO_PROG);
+		film_duration = mpeg12_keep_prog_duration(&next_cadence, 1,
+			frame_prog & PICINFO_PROG,
+			(pic->seqinfo & SEQINFO_EXT_AVAILABLE) &&
+			(pic->seqinfo & SEQINFO_PROG),
+			!!(info & PICINFO_RPT_FIRST), pic->frame_dur);
+	}
+
+	if (frame_prog & PICINFO_PROG) {
 		field_num = 1;
 		type |= VIDTYPE_PROGRESSIVE | VIDTYPE_VIU_FIELD | nv_order;
 	} else {
 #ifdef INTERLACE_SEQ_ALWAYS
 		/* once an interlace seq, force interlace, to make di easy. */
-		hw->dec_control |= DEC_CONTROL_FLAG_FORCE_SEQ_INTERLACE;
+		if (!(hw->dec_control & DEC_CONTROL_FLAG_KEEP_PROG_FRAME))
+			hw->dec_control |= DEC_CONTROL_FLAG_FORCE_SEQ_INTERLACE;
 #endif
 		hw->frame_rpt_state = FRAME_REPEAT_NONE;
 
@@ -1669,6 +1692,8 @@ static int prepare_display_buf(struct vdec_mpeg12_hw_s *hw,
 		hw->vfbuf_use[index]++;
 		vf->index = index;
 		set_frame_info(hw, vf);
+		if (hw->dec_control & DEC_CONTROL_FLAG_KEEP_PROG_FRAME)
+			vf->duration = pic->frame_dur;
 		if (field_num > 1) {
 			vf->duration = vf->duration / field_num;
 			vf->duration_pulldown = (field_num == 3) ?
@@ -1682,14 +1707,20 @@ static int prepare_display_buf(struct vdec_mpeg12_hw_s *hw,
 				type |= (first_field_type == VIDTYPE_INTERLACE_TOP) ?
 					VIDTYPE_INTERLACE_TOP : VIDTYPE_INTERLACE_BOTTOM;
 		} else {
-			if ((hw->seqinfo & SEQINFO_EXT_AVAILABLE) &&
-				(hw->seqinfo & SEQINFO_PROG)) {
+			u32 sequence = (hw->dec_control & DEC_CONTROL_FLAG_KEEP_PROG_FRAME) ?
+				pic->seqinfo : hw->seqinfo;
+
+			if ((sequence & SEQINFO_EXT_AVAILABLE) &&
+				(sequence & SEQINFO_PROG)) {
 				if (info & PICINFO_RPT_FIRST) {
 					if (info & PICINFO_TOP_FIRST)
 						vf->duration *= 3;
 					else
 						vf->duration *= 2;
 				}
+				vf->duration_pulldown = 0;
+			} else if (film_duration) {
+				vf->duration = film_duration;
 				vf->duration_pulldown = 0;
 			} else {
 				vf->duration_pulldown =
@@ -1743,6 +1774,13 @@ static int prepare_display_buf(struct vdec_mpeg12_hw_s *hw,
 				(const struct vframe_s *)vf);
 			spin_unlock_irqrestore(&hw->lock, flags);
 		} else {
+			if (hw->dec_control & DEC_CONTROL_FLAG_KEEP_PROG_FRAME) {
+				hw->keep_prog = next_cadence;
+				if (hw->frame_dur != pic->frame_dur) {
+					hw->frame_dur = pic->frame_dur;
+					vdec_schedule_work(&hw->notify_work);
+				}
+			}
 			debug_print(DECODE_ID(hw), PRINT_FLAG_TIMEINFO,
 				"%s, vf: %lx, num[%d]: %d(%c), dur: %d, type: %x, pts: %d(%lld)\n",
 				__func__, (ulong)vf, i, hw->disp_num, GET_SLICE_TYPE(info),
@@ -1795,43 +1833,51 @@ static int prepare_display_buf(struct vdec_mpeg12_hw_s *hw,
 	return 0;
 }
 
-static void force_interlace_check(struct vdec_mpeg12_hw_s *hw)
+static u32 force_interlace_picture(u32 control, u32 width, u32 height,
+	u32 duration, u32 progressive)
 {
-	if ((hw->dec_control &
+	if ((control &
 	DEC_CONTROL_FLAG_FORCE_2500_720_576_INTERLACE) &&
-		(hw->frame_width == 720) &&
-		(hw->frame_height == 576) &&
-		(hw->frame_dur == 3840)) {
-		hw->frame_prog = 0;
-	} else if ((hw->dec_control
+		(width == 720) &&
+		(height == 576) &&
+		(duration == 3840)) {
+		return 0;
+	} else if ((control
 	& DEC_CONTROL_FLAG_FORCE_3000_704_480_INTERLACE) &&
-		(hw->frame_width == 704) &&
-		(hw->frame_height == 480) &&
-		(hw->frame_dur == 3200)) {
-		hw->frame_prog = 0;
-	} else if ((hw->dec_control
+		(width == 704) &&
+		(height == 480) &&
+		(duration == 3200)) {
+		return 0;
+	} else if ((control
 	& DEC_CONTROL_FLAG_FORCE_2500_704_576_INTERLACE) &&
-		(hw->frame_width == 704) &&
-		(hw->frame_height == 576) &&
-		(hw->frame_dur == 3840)) {
-		hw->frame_prog = 0;
-	} else if ((hw->dec_control
+		(width == 704) &&
+		(height == 576) &&
+		(duration == 3840)) {
+		return 0;
+	} else if ((control
 	& DEC_CONTROL_FLAG_FORCE_2500_544_576_INTERLACE) &&
-		(hw->frame_width == 544) &&
-		(hw->frame_height == 576) &&
-		(hw->frame_dur == 3840)) {
-		hw->frame_prog = 0;
-	} else if ((hw->dec_control
+		(width == 544) &&
+		(height == 576) &&
+		(duration == 3840)) {
+		return 0;
+	} else if ((control
 	& DEC_CONTROL_FLAG_FORCE_2500_480_576_INTERLACE) &&
-		(hw->frame_width == 480) &&
-		(hw->frame_height == 576) &&
-		(hw->frame_dur == 3840)) {
-		hw->frame_prog = 0;
-	} else if (hw->dec_control
-	& DEC_CONTROL_FLAG_FORCE_SEQ_INTERLACE) {
-		hw->frame_prog = 0;
+		(width == 480) &&
+		(height == 576) &&
+		(duration == 3840)) {
+		return 0;
+	} else if ((control & DEC_CONTROL_FLAG_FORCE_SEQ_INTERLACE) &&
+		!(control & DEC_CONTROL_FLAG_KEEP_PROG_FRAME)) {
+		return 0;
 	}
 
+	return progressive;
+}
+
+static void force_interlace_check(struct vdec_mpeg12_hw_s *hw)
+{
+	hw->frame_prog = force_interlace_picture(hw->dec_control, hw->frame_width,
+		hw->frame_height, hw->frame_dur, hw->frame_prog);
 }
 
 static int update_reference(struct vdec_mpeg12_hw_s *hw,
@@ -2137,6 +2183,8 @@ static irqreturn_t vmpeg12_isr_thread_fn(struct vdec_s *vdec, int irq)
 		}
 
 		new_pic->buffer_info = info;
+		new_pic->seqinfo = seqinfo;
+		new_pic->frame_dur = frame_rate_tab[(seqinfo >> 4) & 0xf];
 		new_pic->offset = offset;
 		new_pic->index = index;
 		if (((info & PICINFO_TYPE_MASK) == PICINFO_TYPE_I) ||
@@ -2178,7 +2226,8 @@ static irqreturn_t vmpeg12_isr_thread_fn(struct vdec_s *vdec, int irq)
 
 		hw->frame_prog = info & PICINFO_PROG;
 		if ((seqinfo & SEQINFO_EXT_AVAILABLE) &&
-			((seqinfo & SEQINFO_PROG) == 0))
+			((seqinfo & SEQINFO_PROG) == 0) &&
+			!(hw->dec_control & DEC_CONTROL_FLAG_KEEP_PROG_FRAME))
 			hw->frame_prog = 0;
 		force_interlace_check(hw);
 
@@ -2687,20 +2736,23 @@ static int vmmpeg12_dec_status(struct vdec_s *vdec, struct vdec_info *vstatus)
 	struct vdec_mpeg12_hw_s *hw =
 	(struct vdec_mpeg12_hw_s *)vdec->private;
 
+	u32 frame_dur;
+
 	if (!hw)
 		return -1;
 
+	frame_dur = hw->keep_prog.active ? hw->keep_prog.output_duration : hw->frame_dur;
 	vstatus->frame_width = hw->frame_width;
 	vstatus->frame_height = hw->frame_height;
-	if (hw->frame_dur != 0)
-		vstatus->frame_rate = ((96000 * 10 / hw->frame_dur) % 10) < 5 ?
-		                    96000 / hw->frame_dur : (96000 / hw->frame_dur +1);
+	if (frame_dur != 0)
+		vstatus->frame_rate = ((96000 * 10 / frame_dur) % 10) < 5 ?
+		                    96000 / frame_dur : (96000 / frame_dur +1);
 	else
 		vstatus->frame_rate = -1;
 	vstatus->error_count = READ_VREG(AV_SCRATCH_C);
 	vstatus->status = hw->stat;
 	vstatus->bit_rate = hw->gvs.bit_rate;
-	vstatus->frame_dur = hw->frame_dur;
+	vstatus->frame_dur = frame_dur;
 	vstatus->frame_data = hw->gvs.frame_data;
 	vstatus->total_data = hw->gvs.total_data;
 	vstatus->frame_count = hw->gvs.frame_count;
@@ -3212,6 +3264,7 @@ static void vmpeg12_local_init(struct vdec_mpeg12_hw_s *hw)
 	hw->eos = 0;
 	hw->frame_width = hw->frame_height = 0;
 	hw->frame_dur = hw->frame_prog = 0;
+	mpeg12_keep_prog_reset(&hw->keep_prog);
 	hw->frame_force_skip_flag = 0;
 	hw->wait_buffer_counter = 0;
 	hw->first_i_frame_ready = 0;
@@ -3602,6 +3655,10 @@ void (*callback)(struct vdec_s *, void *),
 
 static void reset(struct vdec_s *vdec)
 {
+	struct vdec_mpeg12_hw_s *hw = vdec->private;
+
+	if (hw)
+		mpeg12_keep_prog_reset(&hw->keep_prog);
 	pr_info("ammvdec_mpeg12: reset.\n");
 }
 

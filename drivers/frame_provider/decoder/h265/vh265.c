@@ -4590,8 +4590,6 @@ static struct PIC_s *output_pic(struct hevc_state_s *hevc,
 				fast_output_enable & 0x1) {
 				/*fast output for first I picture*/
 				pic->num_reorder_pic = 0;
-				if (vdec->master || vdec->slave)
-					pic_display = pic;
 				fisrt_pic_flag = 1;
 				hevc_print(hevc, 0, "VH265: output first frame\n");
 			}

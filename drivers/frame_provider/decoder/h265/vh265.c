@@ -111,6 +111,8 @@ to enable DV of frame mode
 #include <linux/amlogic/media/video_sink/video.h>
 #include <linux/amlogic/media/codec_mm/configs.h>
 #include "../utils/vdec_feature.h"
+#include <linux/vmalloc.h>
+#include "cb1_temporal.h"
 
 #define SEND_LMEM_WITH_RPM
 #define SUPPORT_10BIT
@@ -311,8 +313,9 @@ static u32 pts_unstable;
 #endif
 
 #define BUF_POOL_SIZE	32
-#define MAX_BUF_NUM 24
-#define MAX_REF_PIC_NUM 24
+/* 32 (was 24): deeper ready queue for the cb1 lookahead (ANC table = 32) */
+#define MAX_BUF_NUM 32
+#define MAX_REF_PIC_NUM 32
 #define MAX_REF_ACTIVE  16
 
 #ifdef MV_USE_FIXED_BUF
@@ -2079,6 +2082,10 @@ struct hevc_state_s {
 	u32 vf_pre_count;
 	atomic_t vf_get_count;
 	atomic_t vf_put_count;
+	struct cb1_state *cb1;	/* cb1 lookahead probe, see cb1_measure_vf */
+	u64 cb1_put_ns;		/* time of the last put, cb1 burst measure */
+	u32 cb1_burst;		/* puts in the current vsync */
+	u32 cb1_burst_max;	/* largest burst since the last second wrap */
 #ifdef SWAP_HEVC_UCODE
 	dma_addr_t mc_dma_handle;
 	void *mc_cpu_addr;
@@ -8496,8 +8503,11 @@ static void release_pic_mmu_buf(struct hevc_state_s *hevc,
  */
 static struct hevc_state_s *gHevc;
 
+static void cb1_free(struct hevc_state_s *hevc);
+
 static void hevc_local_uninit(struct hevc_state_s *hevc)
 {
+	cb1_free(hevc);
 	hevc->rpm_ptr = NULL;
 	hevc->lmem_ptr = NULL;
 
@@ -9591,6 +9601,20 @@ static void vh265_vf_put(struct vframe_s *vf, void *op_arg)
 			);
 
 	atomic_add(1, &hevc->vf_put_count);
+	if (hevc->cb1) {
+		/*
+		 * cb1: pictures skipped by the display (source rate above the
+		 * output rate) are all put back in the same vsync; puts < 2 ms
+		 * apart count as one burst (see cb1_lookahead).
+		 */
+		u64 now = ktime_get_mono_fast_ns();
+
+		hevc->cb1_burst = now - hevc->cb1_put_ns < 2000000 ?
+			hevc->cb1_burst + 1 : 1;
+		hevc->cb1_put_ns = now;
+		if (hevc->cb1_burst > hevc->cb1_burst_max)
+			hevc->cb1_burst_max = hevc->cb1_burst;
+	}
 	spin_lock_irqsave(&lock, flags);
 	kfifo_put(&hevc->newframe_q, (const struct vframe_s *)vf);
 	ATRACE_COUNTER(hevc->trace.new_q_name, kfifo_len(&hevc->newframe_q));
@@ -9991,8 +10015,525 @@ static inline void hevc_update_gvs(struct hevc_state_s *hevc, struct PIC_s *pic)
 		hevc->gvs->ratio_control = hevc->ratio_control;
 }
 
+/*
+ * cb1 lookahead probe (step 1, measurement only, the picture is unchanged).
+ * When cb1_meas & 1, every decoded frame is measured on its double-write
+ * copy (needs double_write_mode 3 = 1/4 per side, NV21 8 bit, linear) as it
+ * enters the display queue, i.e. ahead of display by the ready-queue depth.
+ * maxRGB per pixel (BT.2020 NCL limited -> PQ code 0..4095), sampled every
+ * 2nd pixel and line. cb1_meas & 2 logs one line per frame,
+ * cb1_meas & 4 swaps the chroma byte order (U/V order check).
+ */
+static u32 cb1_meas;
+module_param(cb1_meas, uint, 0664);
+MODULE_PARM_DESC(cb1_meas, "\n cb1 probe: 1 measure dw copy + temporal L1, 2 log cb1m, 4 swap UV, 8 log cb1t, 16 publish L1 to amdolby_vision\n");
+
+/* cb1_meas & 16: hand each ready L1 to amdolby_vision (keyed by vf->pts) */
+#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+#include <linux/amlogic/media/amdolbyvision/dolby_vision.h>
+#define cb1_dv_put(pts, l1) do { \
+		if ((cb1_meas & 16) && (pts) > 0 && (pts) <= 0xffffffffLL) \
+			dv_cb1_put_l1((u32)(pts), (l1)[0], (l1)[1], (l1)[2]); \
+	} while (0)
+#define cb1_dv_flush() do { if (cb1_meas & 16) dv_cb1_flush(); } while (0)
+#else
+#define cb1_dv_put(pts, l1) do { } while (0)
+#define cb1_dv_flush() do { } while (0)
+#endif
+
+/*
+ * Lookahead in pictures (0 = always 1 s): the decoder holds ~25 pictures
+ * ahead of display, so 1 s fits at 24p only; 24 pictures keeps the same
+ * margin at any rate (0.4 s at 60p), clamped to 0.2..1 s by cb1_temporal.
+ */
+static u32 cb1_la_frames = 24;
+module_param(cb1_la_frames, uint, 0664);
+MODULE_PARM_DESC(cb1_la_frames, "\n cb1 lookahead in pictures, 0 = 1 s\n");
+
+/*
+ * Closed loop (cb1_la_margin > 0, default 2; 0 = fixed cb1_la_frames): the
+ * lookahead follows the measured pipeline depth (pictures queued ahead of the
+ * one on screen, = vf_pre_count - vf_put_count when a picture is pushed,
+ * minus the largest put burst - 1 when the display skips pictures), so a
+ * result lands ~margin pictures before display at any rate:
+ *   target = depth - margin, in pictures, clamped to 0.2..1 s;
+ *   down at once when depth - lookahead < 1 (the L1 would be late),
+ *   up by 1 picture per second of pictures when the lowest depth of that
+ *   second still leaves more than margin (slow, so the L1 of a shot on screen
+ *   does not move, and depth dips do not ratchet it up and down),
+ *   both ways at once during the first 2 s after a start / reset (the queue
+ *   is still filling; those pictures fall back to the static L1 anyway).
+ * The tick lookahead is la pictures minus 1 ms: box pts are rounded to the
+ * ms, so P + la then always closes the window of P (ready one picture
+ * earlier half of the time otherwise, margin 1 instead of 2 at 24p).
+ */
+static u32 cb1_la_margin = 2;
+module_param(cb1_la_margin, uint, 0664);
+MODULE_PARM_DESC(cb1_la_margin, "\n cb1 closed-loop lookahead margin in pictures, 0 = fixed cb1_la_frames\n");
+/*
+ * How far ahead (ms, 0..1000) a brighter picture may raise L1 max. The
+ * original raises it a full lookahead (1 s) early, so the picture dims
+ * before the highlight is on screen; a short lead lets the highlight mask
+ * the change. Cut detection and the darker side are unchanged.
+ */
+static u32 cb1_rise_ms = 250;
+module_param(cb1_rise_ms, uint, 0664);
+MODULE_PARM_DESC(cb1_rise_ms, "\n cb1: ms ahead a brighter picture may raise L1 max (1000 = original)\n");
+/*
+ * Rate limit of L1 max rises inside a shot (12-bit PQ codes per second,
+ * 0 = unlimited = original). A large in-shot rise dims the mids visibly
+ * whatever its timing; spreading it over seconds keeps it below notice.
+ * Cuts reset the ramp. Default 75 + a 250 ms lead: blind A/B winner
+ * on an in-shot rise (rate 0 dims, 150 barely), no loss seen on Matrix.
+ */
+static u32 cb1_rise_rate = 75;
+module_param(cb1_rise_rate, uint, 0664);
+MODULE_PARM_DESC(cb1_rise_rate, "\n cb1: max L1 max rise inside a shot, 12-bit codes/s (0 = unlimited)\n");
+
+/*
+ * In-shot stability (0 = off): a move of L1 is hidden at a cut and visible
+ * inside a shot. cb1_open_ms: what the lookahead shows of the first ms of a
+ * shot raises L1 max from the cut on. cb1_max_hyst / cb1_avg_hyst: dead bands
+ * in 12-bit codes, L1 max stays up to max_hyst under its baseline, L1 avg
+ * follows its baseline at avg_hyst.
+ */
+static u32 cb1_open_ms = 1000;
+module_param(cb1_open_ms, uint, 0664);
+MODULE_PARM_DESC(cb1_open_ms, "\n cb1: ms after a cut that raise L1 max from the cut on (0 = off)\n");
+
+static u32 cb1_max_hyst = 48;
+module_param(cb1_max_hyst, uint, 0664);
+MODULE_PARM_DESC(cb1_max_hyst, "\n cb1: in-shot L1 max rises under this are not followed, 12-bit codes\n");
+
+static u32 cb1_avg_hyst = 16;
+module_param(cb1_avg_hyst, uint, 0664);
+MODULE_PARM_DESC(cb1_avg_hyst, "\n cb1: in-shot L1 avg dead band, 12-bit codes (0 = off)\n");
+
+/*
+ * Shot-to-shot dead band of L1 max (0 = off): a cut whose new baseline is
+ * within cb1_cut_hyst 12-bit codes of the current output keeps the output, so
+ * consecutive shots of one scene share a curve.
+ */
+static u32 cb1_cut_hyst = 48;
+module_param(cb1_cut_hyst, uint, 0664);
+MODULE_PARM_DESC(cb1_cut_hyst, "\n cb1: shot-to-shot L1 max dead band, 12-bit codes (0 = off)\n");
+#define CB1_LA_WARM (2 * CB1T_HZ)
+#define CB1_LA_TOL  (CB1T_HZ / 1000)
+
+#define CB1_Q 16
+#define CB1_CY  ((s32)(4095LL * 65536 / 219))
+#define CB1_CRR ((s32)(4095LL * 14746 * 65536 / (224LL * 10000)))
+#define CB1_CBG ((s32)(4095LL * 16455 * 65536 / (224LL * 100000)))
+#define CB1_CRG ((s32)(4095LL * 57135 * 65536 / (224LL * 100000)))
+#define CB1_CBB ((s32)(4095LL * 18814 * 65536 / (224LL * 10000)))
+
+/*
+ * Step 2: the measure feeds CB1's temporal L1 (cb1_temporal.c, integer port,
+ * 1 s lookahead in pts). Per frame, from the double-write copy:
+ *   active area = rows/cols holding a sample with maxRGB code > 0,
+ *   gmin  = min of min(R,G,B) over the active area (every 2nd px/line),
+ *   gmax  = max of max(R,G,B) over the active area + CB1_MAX_BIAS codes,
+ *   gmean = mean maxRGB on a 256x144 grid of the active area,
+ *   motion = 32x18 grid per R,G,B plane of box means (1/128 x 1/72 of the
+ *            frame each, at every 1/32 x 1/18), planar R,G,B,
+ * all in Q16 (code * 65535 / 4095). Pictures are pushed in display order and
+ * polled in order; cb1_meas & 8 logs one "cb1t:" line per result.
+ */
+#define CB1_MAX_BIAS 64
+
+struct cb1_state {
+	struct cb1t_ctx ctx;
+	u16 motion[CB1T_MOTION];
+	u16 *mx, *mn;		/* stride-2 maxRGB / minRGB codes */
+	u8 *row, *col;		/* active flags */
+	u32 cap, sw, sh;
+	u64 pushed, polled;	/* picture ids, 1-based */
+	s64 last_pts;
+	s64 seq_off;		/* vf_pre_count + 1 - picture id */
+	u32 resets;
+	u32 la;			/* closed-loop lookahead, pictures (0 = unset) */
+	u32 la_up;		/* 1/96000 s of pictures in the current second */
+	s64 la_dmin;		/* lowest depth in the current second */
+	s64 la_warm;		/* pts until which la follows depth both ways */
+	s64 la_depth;		/* depth at the last push, for the log */
+	u32 la_burst;		/* burst used at the last push, for the log */
+	u32 burst_prev;		/* largest put burst of the previous second */
+	u32 burst_up;		/* 1/96000 s of pictures since the burst wrap */
+};
+
+/*
+ * Lookahead in 90 kHz ticks for the picture being pushed (duration in
+ * 1/96000 s). Closed loop: see cb1_la_margin.
+ */
+static s64 cb1_lookahead(struct hevc_state_s *hevc, struct cb1_state *s,
+			 u32 dur, s64 pts)
+{
+	s64 depth, target;
+	u32 lo, hi, burst;
+
+	if (!dur)
+		return CB1T_HZ;
+	if (!cb1_la_margin)
+		return cb1_la_frames ?
+			(s64)div_u64((u64)dur * 15 * cb1_la_frames, 16) :
+			(s64)CB1T_HZ;
+	hi = 96000 / dur;			/* 1 s */
+	lo = (96000 / 5 + dur - 1) / dur;	/* 0.2 s */
+	if (hi < 1)
+		hi = 1;
+	if (lo > hi)
+		lo = hi;
+	depth = (s64)hevc->vf_pre_count -
+		(s64)atomic_read(&hevc->vf_put_count);
+	/*
+	 * A display slower than the source takes N pictures per vsync and
+	 * puts them back together: the one on screen is then up to N - 1
+	 * pictures past what put_count says. Remove the largest burst of the
+	 * last 1-2 s, so the margin holds at any source / output rate ratio.
+	 */
+	burst = max(s->burst_prev, READ_ONCE(hevc->cb1_burst_max));
+	s->burst_up += dur;
+	if (s->burst_up >= 96000) {
+		s->burst_prev = READ_ONCE(hevc->cb1_burst_max);
+		WRITE_ONCE(hevc->cb1_burst_max, 0);
+		s->burst_up = 0;
+	}
+	if (burst > 1)
+		depth -= burst - 1;
+	s->la_burst = burst;
+	s->la_depth = depth;
+	target = depth - cb1_la_margin;
+	if (target < lo)
+		target = lo;
+	if (target > hi)
+		target = hi;
+	if (!s->la) {
+		s->la = hi;
+		s->la_warm = pts + CB1_LA_WARM;
+	}
+	if (s->la > hi)
+		s->la = hi;
+	if (!s->la_up || depth < s->la_dmin)
+		s->la_dmin = depth;
+	s->la_up += dur;
+	if (pts < s->la_warm || depth - s->la < 1) {
+		s->la = target;
+		s->la_up = 0;
+	} else if (s->la_up >= 96000) {
+		if (s->la_dmin - cb1_la_margin > s->la && s->la < hi)
+			s->la++;
+		s->la_up = 0;
+	}
+	return (s64)div_u64((u64)dur * 15 * s->la, 16) - CB1_LA_TOL;
+}
+
+static void cb1_free(struct hevc_state_s *hevc)
+{
+	struct cb1_state *s = hevc->cb1;
+
+	if (!s)
+		return;
+	cb1_dv_flush();
+	vfree(s->mx);
+	vfree(s->mn);
+	vfree(s->row);
+	vfree(s->col);
+	vfree(s);
+	hevc->cb1 = NULL;
+}
+
+static inline void cb1_rgb(const u8 *yl, const u8 *cl, int x, int swap,
+			   s32 *r, s32 *g, s32 *b)
+{
+	int cx = x & ~1;
+	s32 yy = ((s32)yl[x] - 16) * CB1_CY;
+	s32 cb = (s32)cl[cx + swap] - 128;
+	s32 cr = (s32)cl[cx + 1 - swap] - 128;
+
+	*r = clamp_t(s32, (yy + cr * CB1_CRR) >> CB1_Q, 0, 4095);
+	*g = clamp_t(s32, (yy - cb * CB1_CBG - cr * CB1_CRG) >> CB1_Q, 0, 4095);
+	*b = clamp_t(s32, (yy + cb * CB1_CBB) >> CB1_Q, 0, 4095);
+}
+
+/* 12-bit code (or a sum of n codes) to Q16 */
+static inline u16 cb1_q16(u64 sum, u64 n)
+{
+	u64 v = div64_u64(sum * 65535 + n * 2047, n * 4095);
+
+	return v > 65535 ? 65535 : (u16)v;
+}
+
+static void cb1_poll_all(struct hevc_state_s *hevc, struct cb1_state *s)
+{
+	struct cb1t_result r;
+	enum cb1t_status st;
+
+	while (s->polled < s->pushed) {
+		st = cb1t_poll(&s->ctx, s->polled + 1, &r);
+		if (st == CB1T_PENDING)
+			break;
+		s->polled++;
+		if (st == CB1T_READY)
+			cb1_dv_put(r.pts, r.l1);
+		if (!(cb1_meas & 8))
+			continue;
+		if (st != CB1T_READY) {
+			pr_info("cb1t: id %llu invalid\n", s->polled);
+			continue;
+		}
+		/*
+		 * ahead > 0: the picture is still in the display queue (not
+		 * taken by the receiver); disp > 0: not shown yet (a picture
+		 * is put back once the next one is on screen).
+		 */
+		pr_info("cb1t: pts %lld id %llu l1 %u %u %u peak %u until %lld ahead %lld q %d disp %lld la %u depth %lld burst %u\n",
+			r.pts, s->polled, r.l1[0], r.l1[1], r.l1[2], r.peak,
+			r.observed_until,
+			(s64)s->polled + s->seq_off -
+			atomic_read(&hevc->vf_get_count),
+			kfifo_len(&hevc->display_q),
+			(s64)s->polled + s->seq_off - 1 -
+			atomic_read(&hevc->vf_put_count),
+			s->la, s->la_depth, s->la_burst);
+	}
+}
+
+/* End of stream: the last second has no lookahead left, flush it out. */
+static void cb1_end(struct hevc_state_s *hevc)
+{
+	struct cb1_state *s = hevc->cb1;
+
+	if (!s || !s->pushed)
+		return;
+	cb1t_end(&s->ctx);
+	cb1_poll_all(hevc, s);
+	if (cb1_meas & 8)
+		pr_info("cb1t: end pushed %llu polled %llu\n", s->pushed, s->polled);
+}
+
+static void cb1_measure_vf(struct hevc_state_s *hevc, struct vframe_s *vf)
+{
+	struct PIC_s *pic;
+	struct cb1_state *s = hevc->cb1;
+	struct cb1t_frame d;
+	enum cb1t_status st;
+	int idx = vf->index & 0xff;
+	int ratio, w, h, stride, ch, x, y, i, j, c;
+	int sw, sh, bx0, bx1, by0, by1, bw, bh;
+	u8 *ybuf, *cbuf;
+	u32 ysize, csize, vmin = 4095, vmax = 0, gmin = 4095, gmax = 0;
+	u32 n = 0, nlit = 0, cap, bs_w, bs_h;
+	u64 sum = 0, sumlit = 0, gsum = 0;
+	ktime_t t0 = ktime_get();
+	int swap = (cb1_meas & 4) ? 1 : 0;
+
+	if (idx >= MAX_REF_PIC_NUM || !hevc->m_PIC[idx])
+		return;
+	pic = hevc->m_PIC[idx];
+	if (!pic->double_write_mode || hevc->mem_map_mode != 0) {
+		if (cb1_meas & 2)
+			pr_info("cb1m: skip dw %d map %d\n",
+				pic->double_write_mode, hevc->mem_map_mode);
+		return;
+	}
+	ratio = get_double_write_ratio(hevc, pic->double_write_mode);
+	w = pic->width / ratio;
+	h = pic->height / ratio;
+	if (w < 64 || h < 36)
+		return;
+	stride = ALIGN(w, 32);
+	ch = ALIGN(h, 32);
+	ysize = stride * ch;
+	csize = stride * ch / 2;
+	sw = (w + 1) / 2;
+	sh = (h + 1) / 2;
+	cap = sw * sh;
+
+	if (!s) {
+		s = vzalloc(sizeof(*s));
+		if (!s)
+			return;
+		cb1t_reset(&s->ctx);
+		hevc->cb1 = s;
+	}
+	if (cap > s->cap || sw > s->sw || sh > s->sh) {
+		vfree(s->mx);
+		vfree(s->mn);
+		vfree(s->row);
+		vfree(s->col);
+		s->mx = vmalloc(cap * sizeof(u16));
+		s->mn = vmalloc(cap * sizeof(u16));
+		s->row = vmalloc(sh);
+		s->col = vmalloc(sw);
+		if (!s->mx || !s->mn || !s->row || !s->col) {
+			s->cap = s->sw = s->sh = 0;
+			return;
+		}
+		s->cap = cap;
+		s->sw = sw;
+		s->sh = sh;
+	}
+
+	ybuf = codec_mm_vmap(pic->dw_y_adr, ysize);
+	if (!ybuf)
+		return;
+	cbuf = codec_mm_vmap(pic->dw_u_v_adr, csize);
+	if (!cbuf) {
+		codec_mm_unmap_phyaddr(ybuf);
+		return;
+	}
+	codec_mm_dma_flush(ybuf, ysize, DMA_FROM_DEVICE);
+	codec_mm_dma_flush(cbuf, csize, DMA_FROM_DEVICE);
+
+	/* pass 1: stride-2 maxRGB / minRGB, active rows and columns */
+	memset(s->row, 0, sh);
+	memset(s->col, 0, sw);
+	for (y = 0; y < sh; y++) {
+		const u8 *yl = ybuf + 2 * y * stride;
+		const u8 *cl = cbuf + y * stride;
+		u16 *mxl = s->mx + y * sw, *mnl = s->mn + y * sw;
+
+		for (x = 0; x < sw; x++) {
+			s32 r, g, b, m;
+
+			cb1_rgb(yl, cl, 2 * x, swap, &r, &g, &b);
+			m = max3(r, g, b);
+			mxl[x] = m;
+			mnl[x] = min3(r, g, b);
+			if (m < vmin)
+				vmin = m;
+			if (m > vmax)
+				vmax = m;
+			sum += m;
+			n++;
+			if (m > 1) {
+				sumlit += m;
+				nlit++;
+			}
+			if (m > 0) {
+				s->row[y] = 1;
+				s->col[x] = 1;
+			}
+		}
+	}
+
+	/* motion: 32x18 box means per plane, on the full frame, stride 1 */
+	bs_w = max((w + 127) / 128, 1);
+	bs_h = max((h + 71) / 72, 1);
+	for (j = 0; j < 18; j++) {
+		int y0 = j * h / 18;
+
+		for (i = 0; i < 32; i++) {
+			int x0 = i * w / 32;
+			u32 acc[3] = {0, 0, 0}, cnt = 0;
+
+			for (y = y0; y < y0 + (int)bs_h && y < h; y++) {
+				const u8 *yl = ybuf + y * stride;
+				const u8 *cl = cbuf + (y / 2) * stride;
+
+				for (x = x0; x < x0 + (int)bs_w && x < w; x++) {
+					s32 r, g, b;
+
+					cb1_rgb(yl, cl, x, swap, &r, &g, &b);
+					acc[0] += r;
+					acc[1] += g;
+					acc[2] += b;
+					cnt++;
+				}
+			}
+			for (c = 0; c < 3; c++)
+				s->motion[c * CB1T_PLANE + j * 32 + i] =
+					cnt ? cb1_q16(acc[c], cnt) : 0;
+		}
+	}
+	codec_mm_unmap_phyaddr(cbuf);
+	codec_mm_unmap_phyaddr(ybuf);
+
+	/* pass 2: active area, gmin / gmax over it, gmean on a 256x144 grid */
+	for (by0 = 0; by0 < sh && !s->row[by0]; by0++)
+		;
+	for (by1 = sh; by1 > by0 && !s->row[by1 - 1]; by1--)
+		;
+	for (bx0 = 0; bx0 < sw && !s->col[bx0]; bx0++)
+		;
+	for (bx1 = sw; bx1 > bx0 && !s->col[bx1 - 1]; bx1--)
+		;
+	if (by0 >= by1 || bx0 >= bx1) {
+		by0 = 0;
+		by1 = sh;
+		bx0 = 0;
+		bx1 = sw;
+	}
+	bw = bx1 - bx0;
+	bh = by1 - by0;
+	for (y = by0; y < by1; y++) {
+		const u16 *mxl = s->mx + y * sw, *mnl = s->mn + y * sw;
+
+		for (x = bx0; x < bx1; x++) {
+			if (mnl[x] < gmin)
+				gmin = mnl[x];
+			if (mxl[x] > gmax)
+				gmax = mxl[x];
+		}
+	}
+	for (j = 0; j < 144; j++) {
+		const u16 *mxl = s->mx + (by0 + j * bh / 144) * sw;
+
+		for (i = 0; i < 256; i++)
+			gsum += mxl[bx0 + i * bw / 256];
+	}
+
+	d.pts = vf->pts;
+	if (!d.pts && s->pushed)
+		d.pts = s->last_pts + div_u64((u64)vf->duration * 15, 16);
+	d.gmin = cb1_q16(gmin, 1);
+	d.gmax = cb1_q16(gmax + CB1_MAX_BIAS, 1);
+	d.gmean = cb1_q16(gsum, 256 * 144);
+
+	/* vf->duration is in 1/96000 s, pts in 1/90000 s */
+	cb1t_set_lookahead(&s->ctx, cb1_lookahead(hevc, s, vf->duration, d.pts));
+	cb1t_set_rise_lead(&s->ctx, (s64)cb1_rise_ms * CB1T_HZ / 1000);
+	cb1t_set_rise_rate(&s->ctx, cb1_rise_rate);
+	cb1t_set_open(&s->ctx, (s64)cb1_open_ms * CB1T_HZ / 1000);
+	cb1t_set_max_hyst(&s->ctx, cb1_max_hyst);
+	cb1t_set_avg_hyst(&s->ctx, cb1_avg_hyst);
+	cb1t_set_cut_hyst(&s->ctx, cb1_cut_hyst);
+	st = cb1t_push(&s->ctx, &d, s->motion, s->pushed + 1);
+	if (st == CB1T_INVALID && s->pushed) {
+		/* seek / pts going back: restart the temporal state */
+		cb1t_reset(&s->ctx);
+		cb1_dv_flush();
+		s->polled = s->pushed;
+		s->resets++;
+		s->la_warm = d.pts + CB1_LA_WARM;
+		if (cb1_meas & 8)
+			pr_info("cb1t: reset %u at pts %lld\n", s->resets, d.pts);
+		st = cb1t_push(&s->ctx, &d, s->motion, s->pushed + 1);
+	}
+	if (st == CB1T_READY) {
+		s->pushed++;
+		s->last_pts = d.pts;
+		s->seq_off = (s64)hevc->vf_pre_count + 1 - (s64)s->pushed;
+		cb1_poll_all(hevc, s);
+	} else if (cb1_meas & 8) {
+		pr_info("cb1t: push status %d pts %lld\n", st, d.pts);
+	}
+
+	if (cb1_meas & 2)
+		pr_info("cb1m: pts %u idx %d %dx%d min %u max %u avg %u avglit %u area %d,%d-%d,%d gmin %u gmax %u gmean %u q %d t %lldus\n",
+			vf->pts, idx, w, h, vmin, vmax,
+			n ? (u32)div_u64(sum, n) : 0,
+			nlit ? (u32)div_u64(sumlit, nlit) : 0,
+			2 * bx0, 2 * by0, 2 * bx1, 2 * by1,
+			d.gmin, d.gmax, d.gmean,
+			kfifo_len(&hevc->display_q),
+			ktime_us_delta(ktime_get(), t0));
+}
+
 static void put_vf_to_display_q(struct hevc_state_s *hevc, struct vframe_s *vf)
 {
+	if (cb1_meas & 1)
+		cb1_measure_vf(hevc, vf);
 	hevc->vf_pre_count++;
 	decoder_do_frame_check(hw_to_vdec(hevc), vf);
 	vdec_vframe_ready(hw_to_vdec(hevc), vf);
@@ -11128,6 +11669,7 @@ static int v4l_res_change(struct hevc_state_s *hevc, union param_u *rpm_param)
 			ctx->v4l_resolution_change = 1;
 			hevc->eos = 1;
 			flush_output(hevc, NULL);
+			cb1_end(hevc);
 			//del_timer_sync(&hevc->timer);
 			notify_v4l_eos(hw_to_vdec(hevc));
 
@@ -14241,6 +14783,7 @@ static void vh265_work_implement(struct hevc_state_s *hevc,
 			"%s: end of stream, last dec poc %d => 0x%pf\n",
 			__func__, hevc->curr_POC, pic);
 		flush_output(hevc, pic);
+		cb1_end(hevc);
 		/* dummy vf with eos flag to backend */
 		notify_v4l_eos(hw_to_vdec(hevc));
 #ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION

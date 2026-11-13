@@ -10345,16 +10345,26 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 				break;
 			}
 	}
+	/* Keep a full tap sample of margin from the measured edge even
+	 * when snapping moved the reported border into the picture.
+	 */
+	if (frame_valid) {
+		for (i = 0; i < ARRAY_SIZE(edges); i++) {
+			unsigned int inset = min(offset[i], border[i] * P3I_LUMA_SCALE);
+
+			offset[i] = max(inset, (unsigned int)P3I_LUMA_SCALE) - P3I_LUMA_SCALE;
+		}
+	}
 publish:
 	spin_lock_irqsave(&p3i_border_lock, flags);
 	if (frame_valid) {
 		struct provider_active_area_req_s *area = &hevc->p3i_frame_area[slot];
 
 		area->vf = vf;
-		area->top = max(offset[0], (unsigned int)P3I_LUMA_SCALE) - P3I_LUMA_SCALE;
-		area->bottom = max(offset[1], (unsigned int)P3I_LUMA_SCALE) - P3I_LUMA_SCALE;
-		area->left = max(offset[2], (unsigned int)P3I_LUMA_SCALE) - P3I_LUMA_SCALE;
-		area->right = max(offset[3], (unsigned int)P3I_LUMA_SCALE) - P3I_LUMA_SCALE;
+		area->top = offset[0];
+		area->bottom = offset[1];
+		area->left = offset[2];
+		area->right = offset[3];
 		area->valid = true;
 	}
 	if (publish_latest && hevc->p3i_border_token && id < ARRAY_SIZE(p3i_border_sessions) &&

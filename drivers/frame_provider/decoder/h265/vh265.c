@@ -278,7 +278,7 @@ struct p3i_border_sample {
 	u16 width, height;
 	u16 bounds[4];
 	u16 snapped[4];
-	u8 peak;
+	u8 scale, peak;
 };
 
 static struct p3i_border_sample p3i_border_sample;
@@ -2141,7 +2141,7 @@ struct hevc_state_s {
 	u32 mem_map_mode;
 	u32 p3i_border_owner;
 	u32 p3i_border_token;
-	bool p3i_border_enabled;
+	u8 p3i_border_scale; /* zero when the private tap is unavailable */
 	unsigned long p3i_border_next;
 	bool p3i_frame_l5;
 	struct provider_active_area_req_s p3i_frame_area[VF_POOL_SIZE];
@@ -2381,18 +2381,22 @@ static int get_dynamic_buf_num_margin(struct hevc_state_s *hevc)
 }
 #endif
 
-#define P3I_LUMA_SCALE 4
-
-static bool p3i_border_raster(unsigned int width, unsigned int height)
+static bool p3i_border_raster(unsigned int width, unsigned int height,
+			      unsigned int scale)
 {
-	/* Keep the quarter-scale linear rows aligned to 32 bytes. */
-	return width >= 256 && width <= 3840 && width % (32 * P3I_LUMA_SCALE) == 0 &&
-		height >= 256 && height <= 2176 && height % P3I_LUMA_SCALE == 0;
+	/* Keep the private linear rows aligned to 32 bytes. */
+	return width >= 256 && width <= 3840 && width % (32 * scale) == 0 &&
+		height >= 256 && height <= 2176 && height % scale == 0;
+}
+
+static int p3i_border_write_mode(unsigned int scale)
+{
+	return scale == 2 ? 5 : 3;
 }
 
 static int get_double_write_mode(struct hevc_state_s *hevc)
 {
-	u32 valid_dw_mode = hevc->p3i_border_enabled ? 0x2000 :
+	u32 valid_dw_mode = hevc->p3i_border_scale ? 0x2000 :
 		get_valid_double_write_mode(hevc);
 	int w = hevc->pic_w;
 	int h = hevc->pic_h;
@@ -2424,8 +2428,9 @@ static int get_double_write_mode(struct hevc_state_s *hevc)
 	/* Keep the extra write inside the decoder. The display still receives
 	 * the original full-resolution AFBC frame.
 	 */
-	if (!dw && hevc->p3i_border_enabled && p3i_border_raster(w, h))
-		return 3;
+	if (!dw && hevc->p3i_border_scale &&
+	    p3i_border_raster(w, h, hevc->p3i_border_scale))
+		return p3i_border_write_mode(hevc->p3i_border_scale);
 
 	return dw;
 }
@@ -2433,8 +2438,9 @@ static int get_double_write_mode(struct hevc_state_s *hevc)
 static int display_double_write_mode(const struct hevc_state_s *hevc,
 				     const struct PIC_s *pic)
 {
-	if (hevc->p3i_border_enabled && pic->double_write_mode == 3 &&
-	    p3i_border_raster(pic->width, pic->height))
+	if (hevc->p3i_border_scale &&
+	    pic->double_write_mode == p3i_border_write_mode(hevc->p3i_border_scale) &&
+	    p3i_border_raster(pic->width, pic->height, hevc->p3i_border_scale))
 		return 0;
 
 	return pic->double_write_mode;
@@ -10149,7 +10155,7 @@ static bool p3i_asymmetric_edge(const u8 *luma, const struct p3i_border_edge *ed
  * thickness of two nearly equal bars without shifting the picture center.
  */
 static void p3i_snap_borders(unsigned int width, unsigned int height,
-			     unsigned int *offset)
+			     unsigned int scale, unsigned int *offset)
 {
 	static const unsigned int common_ar[] = {
 		1333, 1370, 1667, 1778, 1850, 1896, 2000, 2200, 2350,
@@ -10168,7 +10174,7 @@ static void p3i_snap_borders(unsigned int width, unsigned int height,
 		side = 2;
 	else
 		return;
-	if (abs((int)offset[side] - (int)offset[side + 1]) > P3I_LUMA_SCALE)
+	if (abs((int)offset[side] - (int)offset[side + 1]) > scale)
 		return;
 
 	for (i = 0; i < ARRAY_SIZE(common_ar); i++) {
@@ -10198,7 +10204,7 @@ static void p3i_snap_borders(unsigned int width, unsigned int height,
 		return;
 	snapped = DIV_ROUND_CLOSEST((unsigned int)twice_inset, 2 * divisor);
 	adjustment = (int)snapped - (int)((offset[side] + offset[side + 1]) / 2);
-	if (abs(adjustment) >= P3I_LUMA_SCALE ||
+	if (abs(adjustment) >= scale ||
 	    (int)min(offset[side], offset[side + 1]) + adjustment <= 0)
 		return;
 
@@ -10240,21 +10246,24 @@ static bool p3i_border_signal_supported(u32 signal)
 		(transfer == 1 || transfer == 2) && (matrix == 1 || matrix == 2);
 }
 
-static bool p3i_border_supported(const struct PIC_s *pic, const struct vframe_s *vf)
+static bool p3i_border_supported(const struct PIC_s *pic, const struct vframe_s *vf,
+				 unsigned int scale)
 {
 	/* This AFBC path represents conformance by trimming the trailing edges.
-	 * Use whole quarter-resolution cells and the same visible size as VD1.
+	 * Use whole tap cells and the same visible size as VD1.
 	 */
-	return p3i_border_raster(pic->width, pic->height) &&
+	return scale && p3i_border_raster(pic->width, pic->height, scale) &&
+		vf->width % scale == 0 && vf->height % scale == 0 &&
 		vf->width == vf->compWidth && vf->height == vf->compHeight &&
 		vf->width >= 256 && vf->width <= pic->width &&
 		vf->height >= 256 && vf->height <= pic->height &&
 		(!pic->conformance_window_flag ||
 		 !(pic->conf_win_left_offset || pic->conf_win_top_offset)) &&
-		(vf->type & VIDTYPE_COMPRESS) && pic->double_write_mode == 3 && pic->dw_y_adr &&
+		(vf->type & VIDTYPE_COMPRESS) &&
+		pic->double_write_mode == p3i_border_write_mode(scale) && pic->dw_y_adr &&
 		pic->dw_u_v_adr > pic->dw_y_adr &&
 		pic->dw_u_v_adr - pic->dw_y_adr >=
-			(pic->width / P3I_LUMA_SCALE) * (vf->height / P3I_LUMA_SCALE) &&
+			(pic->width / scale) * (vf->height / scale) &&
 		p3i_border_signal_supported(pic->video_signal_type);
 }
 
@@ -10275,11 +10284,12 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 	unsigned long flags;
 	unsigned long now = jiffies;
 	unsigned int id = hw_to_vdec(hevc)->id;
-	int stride = pic->width / P3I_LUMA_SCALE;
-	unsigned int width = vf->width / P3I_LUMA_SCALE;
-	unsigned int height = vf->height / P3I_LUMA_SCALE;
+	unsigned int scale = hevc->p3i_border_scale;
+	int stride = pic->width / scale;
+	unsigned int width = vf->width / scale;
+	unsigned int height = vf->height / scale;
 	struct p3i_border_sample sample = {
-		.stamp = now, .width = vf->width, .height = vf->height,
+		.stamp = now, .width = vf->width, .height = vf->height, .scale = scale,
 	};
 	const struct p3i_border_edge edges[] = {
 		{ 0, stride, 1, width, height },
@@ -10307,7 +10317,7 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 
 	if (publish_latest)
 		hevc->p3i_border_next = now + max_t(unsigned long, 1, HZ / 8);
-	if (!p3i_border_supported(pic, vf))
+	if (!p3i_border_supported(pic, vf, scale))
 		goto publish;
 
 	luma = codec_mm_phys_to_virt(pic->dw_y_adr);
@@ -10332,13 +10342,13 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 			goto publish;
 
 	for (i = 0; i < ARRAY_SIZE(edges); i++)
-		offset[i] = P3I_LUMA_SCALE * border[i];
+		offset[i] = scale * border[i];
 	sample.valid = true;
 	sample.bounds[0] = offset[0];
 	sample.bounds[1] = vf->height - 1 - offset[1];
 	sample.bounds[2] = offset[2];
 	sample.bounds[3] = vf->width - 1 - offset[3];
-	p3i_snap_borders(vf->width, vf->height, offset);
+	p3i_snap_borders(vf->width, vf->height, scale, offset);
 	for (i = 0; i < ARRAY_SIZE(edges); i++)
 		sample.snapped[i] = offset[i];
 
@@ -10361,9 +10371,9 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 	 */
 	if (frame_valid) {
 		for (i = 0; i < ARRAY_SIZE(edges); i++) {
-			unsigned int inset = min(offset[i], border[i] * P3I_LUMA_SCALE);
+			unsigned int inset = min(offset[i], border[i] * scale);
 
-			offset[i] = max(inset, (unsigned int)P3I_LUMA_SCALE) - P3I_LUMA_SCALE;
+			offset[i] = max(inset, scale) - scale;
 		}
 	}
 publish:
@@ -10400,18 +10410,18 @@ static void p3i_reset_borders(struct hevc_state_s *hevc, bool retire)
 			p3i_border_owner++;
 	}
 	spin_unlock_irqrestore(&p3i_border_lock, flags);
-	p3i_border_status(hevc, hevc->p3i_border_enabled ? 'P' : 'N', retire);
+	p3i_border_status(hevc, hevc->p3i_border_scale ? 'P' : 'N', retire);
 	hevc->p3i_border_next = jiffies;
 }
 
 static int p3i_format_sample(char *buf, size_t size,
 			     const struct p3i_border_sample *sample)
 {
-	return scnprintf(buf, size, "1 %u %u %u %u %u %u %u 0 %u %u %u %u %u",
+	return scnprintf(buf, size, "1 %u %u %u %u %u %u %u 0 %u %u %u %u %u %u",
 			 sample->sequence, sample->width, sample->height, sample->bounds[0],
 			 sample->bounds[1], sample->bounds[2], sample->bounds[3], sample->peak,
 			 sample->snapped[0], sample->snapped[1],
-			 sample->snapped[2], sample->snapped[3]);
+			 sample->snapped[2], sample->snapped[3], sample->scale);
 }
 
 static int p3i_get_active_area(char *buf, const struct kernel_param *kp)
@@ -10774,13 +10784,13 @@ static int post_video_frame(struct vdec_s *vdec, struct PIC_s *pic)
 			get_double_write_ratio(hevc, display_dw);
 		vf->height = vf->height /
 			get_double_write_ratio(hevc, display_dw);
-		if (hevc->p3i_border_token && hevc->p3i_border_enabled &&
+		if (hevc->p3i_border_token && hevc->p3i_border_scale &&
 		    !pic->error_mark && pic->output_ready &&
 		    !(get_dbg_flag(hevc) & H265_DEBUG_DISPLAY_CUR_FRAME))
-			p3i_border_status(hevc, p3i_border_supported(pic, vf) &&
+			p3i_border_status(hevc, p3i_border_supported(pic, vf, hevc->p3i_border_scale) &&
 				(!hevc->p3i_frame_l5 || (vf->width == 3840 && vf->height == 2160 &&
 				 !hevc->dv_duallayer && !vf->discard_dv_data)) ? 'Y' : 'N', false);
-		if (pic->double_write_mode && !display_dw)
+		if (hevc->p3i_border_scale && pic->double_write_mode && !display_dw)
 			p3i_measure_borders(hevc, pic, vf);
 #ifdef HEVC_PIC_STRUCT_SUPPORT
 		if (pic->pic_struct == 3 || pic->pic_struct == 4) {
@@ -15987,7 +15997,11 @@ static int ammvdec_h265_probe(struct platform_device *pdev)
 	    is_meson_g12b_cpu()) {
 		unsigned long flags;
 
-		hevc->p3i_border_enabled = true;
+		hevc->p3i_border_scale = 4;
+		if (hevc->p3i_border_token &&
+		    get_config_int(pdata->config, "p3i_border_scale", &config_val) == 0 &&
+		    config_val == 2)
+			hevc->p3i_border_scale = 2;
 		if (!hevc->p3i_border_token) {
 			spin_lock_irqsave(&p3i_border_lock, flags);
 			hevc->p3i_border_owner = ++p3i_border_owner;
@@ -16050,7 +16064,7 @@ static int ammvdec_h265_probe(struct platform_device *pdev)
 		vdec_timeline_create(pdata->sync, DRIVER_NAME);
 	}
 
-	p3i_border_status(hevc, hevc->p3i_border_enabled ? 'P' : 'N', false);
+	p3i_border_status(hevc, hevc->p3i_border_scale ? 'P' : 'N', false);
 	return 0;
 }
 

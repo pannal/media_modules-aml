@@ -10067,6 +10067,7 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 	const u8 *luma;
 	unsigned long flags;
 	unsigned long now = jiffies;
+	u32 signal_type = pic->video_signal_type & 0x02ffffff;
 	unsigned int y, x;
 	unsigned int top = 0, bottom = 0, left = 0, right = 0;
 	u8 peak = 0;
@@ -10088,7 +10089,8 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 	/* The tap reads decoded luma. Display metadata may tag PQ as HDR10+. */
 	if (vf->width != 3840 || vf->height != 2160 ||
 	    !(pic->video_signal_type & VIDEO_SIGNAL_TYPE_AVAILABLE_MASK) ||
-	    (pic->video_signal_type & 0x02ffffff) != 0x00091009 ||
+	    /* Limited-range BT.2020 PQ or BT.709. */
+	    (signal_type != 0x00091009 && signal_type != 0x00010101) ||
 	    (pic->conformance_window_flag &&
 	     (pic->conf_win_left_offset || pic->conf_win_right_offset ||
 	      pic->conf_win_top_offset || pic->conf_win_bottom_offset)))

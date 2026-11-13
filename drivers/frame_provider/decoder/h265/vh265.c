@@ -30,6 +30,7 @@
 #include <linux/kfifo.h>
 #include <linux/kthread.h>
 #include <linux/platform_device.h>
+#include <linux/amlogic/cpu_version.h>
 #include <linux/amlogic/media/vfm/vframe.h>
 #include <linux/math64.h>
 #include <linux/amlogic/media/utils/amstream.h>
@@ -264,6 +265,15 @@ static const char * const matrix_coeffs_names[] = {
  *	0x2000,if > 2160p, use mode 4, else use mode 0;
  */
 static u32 double_write_mode = 0x2000;
+static bool p3i_live_borders;
+
+static DEFINE_SPINLOCK(p3i_border_lock);
+static u32 p3i_border_owner;
+static u32 p3i_border_sequence;
+static unsigned long p3i_border_stamp;
+static u16 p3i_border_bounds[4];
+static u8 p3i_border_peak;
+static bool p3i_border_valid;
 
 /*#define DECOMP_HEADR_SURGENT*/
 
@@ -2114,6 +2124,8 @@ struct hevc_state_s {
 	void *v4l2_ctx;
 	bool v4l_params_parsed;
 	u32 mem_map_mode;
+	u32 p3i_border_owner;
+	unsigned long p3i_border_next;
 	u32 performance_profile;
 	struct vdec_info *gvs;
 	u32 res_ch_flag;
@@ -2352,7 +2364,8 @@ static int get_dynamic_buf_num_margin(struct hevc_state_s *hevc)
 
 static int get_double_write_mode(struct hevc_state_s *hevc)
 {
-	u32 valid_dw_mode = get_valid_double_write_mode(hevc);
+	u32 valid_dw_mode = hevc->p3i_border_owner ? 0x2000 :
+		get_valid_double_write_mode(hevc);
 	int w = hevc->pic_w;
 	int h = hevc->pic_h;
 	u32 dw = 0x1; /*1:1*/
@@ -2379,7 +2392,24 @@ static int get_double_write_mode(struct hevc_state_s *hevc)
 		dw = valid_dw_mode;
 		break;
 	}
+
+	/* Keep the extra write inside the decoder. The display still receives
+	 * the original full-resolution AFBC frame.
+	 */
+	if (!dw && hevc->p3i_border_owner && w == 3840 && h == 2160)
+		return 3;
+
 	return dw;
+}
+
+static int display_double_write_mode(const struct hevc_state_s *hevc,
+				     const struct PIC_s *pic)
+{
+	if (hevc->p3i_border_owner && pic->double_write_mode == 3 &&
+	    pic->width == 3840 && pic->height == 2160)
+		return 0;
+
+	return pic->double_write_mode;
 }
 
 static int v4l_parser_get_double_write_mode(struct hevc_state_s *hevc, int w, int h)
@@ -8675,6 +8705,9 @@ static void set_canvas(struct hevc_state_s *hevc, struct PIC_s *pic)
 	int blkmode = hevc->mem_map_mode;
 	int cfg_endian = 0;
 
+	if (pic->double_write_mode && !display_double_write_mode(hevc, pic))
+		return;
+
 	if (get_cpu_major_id() > AM_MESON_CPU_MAJOR_ID_M8B)
 		cfg_endian = hevc->is_used_v4l ? 0 : 7;
 	else
@@ -9148,6 +9181,7 @@ void ateme_parse_sei(struct hevc_state_s *hevc, unsigned char* input, size_t inp
 static void set_frame_info(struct hevc_state_s *hevc, struct vframe_s *vf,
 			struct PIC_s *pic)
 {
+	int display_dw = display_double_write_mode(hevc, pic);
 	unsigned int ar;
 	int i, j;
 	char *p;
@@ -9157,9 +9191,9 @@ static void set_frame_info(struct hevc_state_s *hevc, struct vframe_s *vf,
 		= &vf->prop.master_display_colour;
 
 	vf->width = pic->width /
-		get_double_write_ratio(hevc, pic->double_write_mode);
+		get_double_write_ratio(hevc, display_dw);
 	vf->height = pic->height /
-		get_double_write_ratio(hevc, pic->double_write_mode);
+		get_double_write_ratio(hevc, display_dw);
 
 	vf->duration = hevc->frame_dur;
 	vf->duration_pulldown = 0;
@@ -9991,6 +10025,150 @@ static inline void hevc_update_gvs(struct hevc_state_s *hevc, struct PIC_s *pic)
 		hevc->gvs->ratio_control = hevc->ratio_control;
 }
 
+#define P3I_LUMA_WIDTH 960
+#define P3I_LUMA_HEIGHT 540
+
+/* Inspect the middle half of each line so bars on the other axis do not
+ * bias the vote. Allow isolated noise in the black area.
+ */
+static bool p3i_black_line(const u8 *luma, unsigned int offset,
+			   unsigned int step, unsigned int length)
+{
+	unsigned int light = 0;
+	unsigned int i;
+
+	for (i = 1; i <= 16; i++) {
+		unsigned int pos = length / 4 + (length / 2) * i / 17;
+
+		if (luma[offset + pos * step] > 22 && ++light > 1)
+			return false;
+	}
+	return true;
+}
+
+static unsigned int p3i_border_edge(const u8 *luma, unsigned int start,
+				     int direction, unsigned int stride,
+				     unsigned int length, unsigned int depth)
+{
+	unsigned int edge;
+
+	for (edge = 0; edge <= depth / 3; edge++) {
+		if (!p3i_black_line(luma, start, stride, length))
+			break;
+		start += direction;
+	}
+
+	return edge;
+}
+
+static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
+				 const struct vframe_s *vf)
+{
+	const u8 *luma;
+	unsigned long flags;
+	unsigned long now = jiffies;
+	unsigned int y, x;
+	unsigned int top = 0, bottom = 0, left = 0, right = 0;
+	u8 peak = 0;
+	bool valid = false;
+
+	/* This bounded prototype reads the current PIC synchronously, before
+	 * handoff. Fenced frames can be queued before the write completes.
+	 */
+	if (time_before(now, hevc->p3i_border_next) || in_atomic() ||
+	    irqs_disabled() || vdec_secure(hw_to_vdec(hevc)) ||
+	    hevc->enable_fence || pic->pic_struct ||
+	    pic->error_mark || !pic->output_ready ||
+	    (get_dbg_flag(hevc) & H265_DEBUG_DISPLAY_CUR_FRAME) ||
+	    !pic->dw_y_adr || pic->dw_u_v_adr <= pic->dw_y_adr ||
+	    pic->dw_u_v_adr - pic->dw_y_adr < P3I_LUMA_WIDTH * P3I_LUMA_HEIGHT)
+		return;
+
+	hevc->p3i_border_next = now + max_t(unsigned long, 1, HZ / 8);
+	if (vf->width != 3840 || vf->height != 2160 ||
+	    (vf->signal_type & 0x02ffffff) != 0x00091009 ||
+	    (pic->conformance_window_flag &&
+	     (pic->conf_win_left_offset || pic->conf_win_right_offset ||
+	      pic->conf_win_top_offset || pic->conf_win_bottom_offset)))
+		goto publish;
+
+	luma = codec_mm_phys_to_virt(pic->dw_y_adr);
+	if (!luma)
+		goto publish;
+
+	codec_mm_dma_flush((void *)luma, P3I_LUMA_WIDTH * P3I_LUMA_HEIGHT,
+			  DMA_FROM_DEVICE);
+	for (y = P3I_LUMA_HEIGHT / 4; y < 3 * P3I_LUMA_HEIGHT / 4; y += 32)
+		for (x = P3I_LUMA_WIDTH / 4; x < 3 * P3I_LUMA_WIDTH / 4; x += 32)
+			peak = max(peak, luma[y * P3I_LUMA_WIDTH + x]);
+	if (peak < 40)
+		goto publish;
+
+	top = p3i_border_edge(luma, 0, P3I_LUMA_WIDTH, 1,
+			      P3I_LUMA_WIDTH, P3I_LUMA_HEIGHT);
+	bottom = p3i_border_edge(luma, (P3I_LUMA_HEIGHT - 1) * P3I_LUMA_WIDTH,
+				 -P3I_LUMA_WIDTH, 1, P3I_LUMA_WIDTH,
+				 P3I_LUMA_HEIGHT);
+	left = p3i_border_edge(luma, 0, 1, P3I_LUMA_WIDTH,
+			       P3I_LUMA_HEIGHT, P3I_LUMA_WIDTH);
+	right = p3i_border_edge(luma, P3I_LUMA_WIDTH - 1, -1, P3I_LUMA_WIDTH,
+				P3I_LUMA_HEIGHT, P3I_LUMA_WIDTH);
+	valid = top <= P3I_LUMA_HEIGHT / 3 && bottom <= P3I_LUMA_HEIGHT / 3 &&
+		left <= P3I_LUMA_WIDTH / 3 && right <= P3I_LUMA_WIDTH / 3 &&
+		abs((int)top - (int)bottom) <= 1 &&
+		abs((int)left - (int)right) <= 1;
+
+publish:
+	spin_lock_irqsave(&p3i_border_lock, flags);
+	if (p3i_border_owner == hevc->p3i_border_owner) {
+		p3i_border_valid = valid;
+		if (valid) {
+			p3i_border_stamp = now;
+			p3i_border_sequence++;
+			p3i_border_bounds[0] = 4 * top;
+			p3i_border_bounds[1] = 2159 - 4 * bottom;
+			p3i_border_bounds[2] = 4 * left;
+			p3i_border_bounds[3] = 3839 - 4 * right;
+			p3i_border_peak = peak;
+		}
+	}
+	spin_unlock_irqrestore(&p3i_border_lock, flags);
+}
+
+static void p3i_reset_borders(struct hevc_state_s *hevc, bool retire)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&p3i_border_lock, flags);
+	if (p3i_border_owner == hevc->p3i_border_owner) {
+		p3i_border_valid = false;
+		if (retire)
+			p3i_border_owner++;
+	}
+	spin_unlock_irqrestore(&p3i_border_lock, flags);
+	hevc->p3i_border_next = jiffies;
+}
+
+static int p3i_get_active_area(char *buf, const struct kernel_param *kp)
+{
+	unsigned long flags;
+	int size = -ENODATA;
+
+	spin_lock_irqsave(&p3i_border_lock, flags);
+	if (p3i_border_valid &&
+	    time_before(jiffies, p3i_border_stamp + HZ / 2))
+		size = scnprintf(buf, PAGE_SIZE, "1 %u 3840 2160 %u %u %u %u 0 %u\n",
+				 p3i_border_sequence, p3i_border_bounds[0],
+				 p3i_border_bounds[1], p3i_border_bounds[2],
+				 p3i_border_bounds[3], p3i_border_peak);
+	spin_unlock_irqrestore(&p3i_border_lock, flags);
+	return size;
+}
+
+static const struct kernel_param_ops p3i_active_area_ops = {
+	.get = p3i_get_active_area,
+};
+
 static void put_vf_to_display_q(struct hevc_state_s *hevc, struct vframe_s *vf)
 {
 	hevc->vf_pre_count++;
@@ -10028,6 +10206,7 @@ static int post_video_frame(struct vdec_s *vdec, struct PIC_s *pic)
 	struct vdec_info tmp4x;
 	struct aml_vcodec_ctx * v4l2_ctx = hevc->v4l2_ctx;
 	int index;
+	int display_dw = display_double_write_mode(hevc, pic);
 
 	/* swap uv */
 	if (hevc->is_used_v4l) {
@@ -10117,7 +10296,7 @@ static int post_video_frame(struct vdec_s *vdec, struct PIC_s *pic)
 		vf->index = 0xff00 | pic->index;
 #if 1
 /*SUPPORT_10BIT*/
-		if (pic->double_write_mode & 0x10) {
+		if (display_dw & 0x10) {
 			/* double write only */
 			vf->compBodyAddr = 0;
 			vf->compHeadAddr = 0;
@@ -10133,11 +10312,11 @@ static int post_video_frame(struct vdec_s *vdec, struct PIC_s *pic)
 			}
 			vf->canvas0Addr = vf->canvas1Addr = 0;
 		}
-		if (pic->double_write_mode) {
+		if (display_dw) {
 			vf->type = VIDTYPE_PROGRESSIVE | VIDTYPE_VIU_FIELD;
 			vf->type |= nv_order;
 
-			if (((pic->double_write_mode == 3) || (pic->double_write_mode == 5)) &&
+			if (((display_dw == 3) || (display_dw == 5)) &&
 				(!(IS_8K_SIZE(pic->width, pic->height)))) {
 				vf->type |= VIDTYPE_COMPRESS;
 				if (hevc->mmu_enable)
@@ -10289,9 +10468,11 @@ static int post_video_frame(struct vdec_s *vdec, struct PIC_s *pic)
 			vf->sar_height = hevc->cur_pic->sar_height;
 		}
 		vf->width = vf->width /
-			get_double_write_ratio(hevc, pic->double_write_mode);
+			get_double_write_ratio(hevc, display_dw);
 		vf->height = vf->height /
-			get_double_write_ratio(hevc, pic->double_write_mode);
+			get_double_write_ratio(hevc, display_dw);
+		if (pic->double_write_mode && !display_dw)
+			p3i_measure_borders(hevc, pic, vf);
 #ifdef HEVC_PIC_STRUCT_SUPPORT
 		if (pic->pic_struct == 3 || pic->pic_struct == 4) {
 			struct vframe_s *vf2;
@@ -14764,6 +14945,8 @@ static void reset(struct vdec_s *vdec)
 		del_timer_sync(&hevc->timer);
 		hevc->stat &= ~STAT_TIMER_ARM;
 	}
+	if (hevc->p3i_border_owner)
+		p3i_reset_borders(hevc, false);
 	hevc->dec_result = DEC_RESULT_NONE;
 	reset_process_time(hevc);
 	hevc->pic_list_init_flag = 0;
@@ -15479,6 +15662,23 @@ static int ammvdec_h265_probe(struct platform_device *pdev)
 		"double_write_mode=%d\n",
 		hevc->double_write_mode);
 
+	/* Use the physical SoC ID. The decoder policy maps G12B rev B/C to TL1. */
+	if (READ_ONCE(p3i_live_borders) && !hevc->is_used_v4l &&
+	    !hevc->enable_fence && !hevc->mem_map_mode && hevc->mmu_enable &&
+	    !vdec_secure(pdata) && vdec_frame_based(pdata) &&
+	    !pdata->master && !pdata->slave && double_write_mode == 0x2000 &&
+	    hevc->double_write_mode == 0x2000 &&
+	    hevc->endian == HEVC_CONFIG_LITTLE_ENDIAN &&
+	    is_meson_g12b_cpu()) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&p3i_border_lock, flags);
+		hevc->p3i_border_owner = ++p3i_border_owner;
+		p3i_border_valid = false;
+		spin_unlock_irqrestore(&p3i_border_lock, flags);
+		hevc->p3i_border_next = jiffies;
+	}
+
 	hevc->cma_dev = pdata->cma_dev;
 	vh265_vdec_info_init(hevc);
 
@@ -15575,6 +15775,8 @@ static int ammvdec_h265_remove(struct platform_device *pdev)
 		hevc_print(hevc, 0, "%s\r\n", __func__);
 
 	vmh265_stop(hevc);
+	if (hevc->p3i_border_owner)
+		p3i_reset_borders(hevc, true);
 
 	/* vdec_source_changed(VFORMAT_H264, 0, 0, 0); */
 	if (vdec->parallel_dec == 1)
@@ -15865,6 +16067,10 @@ MODULE_PARM_DESC(buffer_mode, "\n buffer_mode\n");
 
 module_param(double_write_mode, uint, 0664);
 MODULE_PARM_DESC(double_write_mode, "\n double_write_mode\n");
+
+module_param(p3i_live_borders, bool, 0644);
+MODULE_PARM_DESC(p3i_live_borders, "Opt in to the G12B UHD HEVC live border prototype on decoder open");
+module_param_cb(p3i_active_area, &p3i_active_area_ops, NULL, 0444);
 
 module_param(buf_alloc_width, uint, 0664);
 MODULE_PARM_DESC(buf_alloc_width, "\n buf_alloc_width\n");

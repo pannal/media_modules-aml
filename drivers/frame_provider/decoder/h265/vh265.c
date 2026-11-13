@@ -10085,8 +10085,10 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 		return;
 
 	hevc->p3i_border_next = now + max_t(unsigned long, 1, HZ / 8);
+	/* The tap reads decoded luma. Display metadata may tag PQ as HDR10+. */
 	if (vf->width != 3840 || vf->height != 2160 ||
-	    (vf->signal_type & 0x02ffffff) != 0x00091009 ||
+	    !(pic->video_signal_type & VIDEO_SIGNAL_TYPE_AVAILABLE_MASK) ||
+	    (pic->video_signal_type & 0x02ffffff) != 0x00091009 ||
 	    (pic->conformance_window_flag &&
 	     (pic->conf_win_left_offset || pic->conf_win_right_offset ||
 	      pic->conf_win_top_offset || pic->conf_win_bottom_offset)))

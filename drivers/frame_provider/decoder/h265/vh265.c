@@ -10144,6 +10144,59 @@ static bool p3i_asymmetric_edge(const u8 *luma, const struct p3i_border_edge *ed
 	return false;
 }
 
+/* Match Kodi's common ratios, in thousandths. Only a centered image with
+ * bars on one axis supplies enough geometry to infer a different boundary.
+ */
+static void p3i_snap_borders(unsigned int width, unsigned int height,
+			     unsigned int *offset)
+{
+	static const unsigned int common_ar[] = {
+		1333, 1370, 1667, 1778, 1850, 1896, 2000, 2200, 2350,
+		2390, 2400, 2550, 2760,
+	};
+	unsigned int active_width = width - offset[2] - offset[3];
+	unsigned int active_height = height - offset[0] - offset[1];
+	unsigned int best_ar = 0, best_distance = UINT_MAX;
+	unsigned int snapped, side, divisor;
+	int twice_inset;
+	unsigned int i;
+
+	if (offset[0] != offset[1] || offset[2] != offset[3] ||
+	    (!!offset[0] == !!offset[2]))
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(common_ar); i++) {
+		unsigned int distance = abs((int)(active_width * 1000) -
+					   (int)(active_height * common_ar[i]));
+
+		if (distance < best_distance) {
+			best_distance = distance;
+			best_ar = common_ar[i];
+		}
+	}
+
+	/* Allow at most 1% ratio error and less than one tap sample of
+	 * movement on either edge. Leave measured geometry outside that band.
+	 */
+	if (best_distance * 100 > active_width * 1000)
+		return;
+
+	if (offset[0]) {
+		side = 0;
+		divisor = best_ar;
+		twice_inset = (int)(height * best_ar) - (int)(width * 1000);
+	} else {
+		side = 2;
+		divisor = 1000;
+		twice_inset = (int)(width * 1000) - (int)(height * best_ar);
+	}
+	if (twice_inset <= 0)
+		return;
+	snapped = DIV_ROUND_CLOSEST((unsigned int)twice_inset, 2 * divisor);
+	if (snapped && abs((int)snapped - (int)offset[side]) < P3I_LUMA_SCALE)
+		offset[side] = offset[side + 1] = snapped;
+}
+
 static void p3i_border_status(struct hevc_state_s *hevc, char status, bool retire)
 {
 	unsigned int id = hw_to_vdec(hevc)->id;
@@ -10226,6 +10279,7 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 		{ width - 1, -1, stride, height, width },
 	};
 	unsigned int border[ARRAY_SIZE(edges)];
+	unsigned int offset[ARRAY_SIZE(edges)];
 	unsigned int y, x;
 	int slot = hevc->p3i_frame_l5 ? p3i_frame_slot(hevc, vf) : -1;
 	bool publish_latest = !time_before(now, hevc->p3i_border_next);
@@ -10268,11 +10322,14 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 		    !p3i_asymmetric_edge(luma, &edges[i], border[i]))
 			goto publish;
 
+	for (i = 0; i < ARRAY_SIZE(edges); i++)
+		offset[i] = P3I_LUMA_SCALE * border[i];
+	p3i_snap_borders(vf->width, vf->height, offset);
 	sample.valid = true;
-	sample.bounds[0] = P3I_LUMA_SCALE * border[0];
-	sample.bounds[1] = vf->height - 1 - P3I_LUMA_SCALE * border[1];
-	sample.bounds[2] = P3I_LUMA_SCALE * border[2];
-	sample.bounds[3] = vf->width - 1 - P3I_LUMA_SCALE * border[3];
+	sample.bounds[0] = offset[0];
+	sample.bounds[1] = vf->height - 1 - offset[1];
+	sample.bounds[2] = offset[2];
+	sample.bounds[3] = vf->width - 1 - offset[3];
 
 	/* L5 affects the sink. Demand a clear boundary on both sides and
 	 * keep a sample's worth of margin inside the measured black area.
@@ -10294,10 +10351,10 @@ publish:
 		struct provider_active_area_req_s *area = &hevc->p3i_frame_area[slot];
 
 		area->vf = vf;
-		area->top = P3I_LUMA_SCALE * (max(border[0], 1U) - 1);
-		area->bottom = P3I_LUMA_SCALE * (max(border[1], 1U) - 1);
-		area->left = P3I_LUMA_SCALE * (max(border[2], 1U) - 1);
-		area->right = P3I_LUMA_SCALE * (max(border[3], 1U) - 1);
+		area->top = max(offset[0], (unsigned int)P3I_LUMA_SCALE) - P3I_LUMA_SCALE;
+		area->bottom = max(offset[1], (unsigned int)P3I_LUMA_SCALE) - P3I_LUMA_SCALE;
+		area->left = max(offset[2], (unsigned int)P3I_LUMA_SCALE) - P3I_LUMA_SCALE;
+		area->right = max(offset[3], (unsigned int)P3I_LUMA_SCALE) - P3I_LUMA_SCALE;
 		area->valid = true;
 	}
 	if (publish_latest && hevc->p3i_border_token && id < ARRAY_SIZE(p3i_border_sessions) &&

@@ -266,6 +266,7 @@ static const char * const matrix_coeffs_names[] = {
  */
 static u32 double_write_mode = 0x2000;
 static bool p3i_live_borders;
+static bool p3i_fel_borders;
 static bool p3i_frame_l5_capable = true;
 
 static DEFINE_SPINLOCK(p3i_border_lock);
@@ -15990,8 +15991,13 @@ static int ammvdec_h265_probe(struct platform_device *pdev)
 	/* Use the physical SoC ID. The decoder policy maps G12B rev B/C to TL1. */
 	if ((hevc->p3i_border_token || READ_ONCE(p3i_live_borders)) && !hevc->is_used_v4l &&
 	    !hevc->enable_fence && !hevc->mem_map_mode && hevc->mmu_enable &&
-	    !vdec_secure(pdata) && vdec_frame_based(pdata) &&
-	    !pdata->master && !pdata->slave && double_write_mode == 0x2000 &&
+	    !vdec_secure(pdata) && !pdata->master &&
+	    ((vdec_frame_based(pdata) && !pdata->slave) ||
+	     (READ_ONCE(p3i_fel_borders) && hevc->p3i_border_token &&
+	      !hevc->p3i_frame_l5 && pdata->type == VDEC_TYPE_STREAM_PARSER &&
+	      pdata->slave && pdata->slave->master == pdata && !dv_toggle_prov_name &&
+	      (pdata->port->type & PORT_TYPE_DUALDEC))) &&
+	    double_write_mode == 0x2000 &&
 	    hevc->double_write_mode == 0x2000 &&
 	    hevc->endian == HEVC_CONFIG_LITTLE_ENDIAN &&
 	    is_meson_g12b_cpu()) {
@@ -16402,6 +16408,8 @@ module_param(double_write_mode, uint, 0664);
 MODULE_PARM_DESC(double_write_mode, "\n double_write_mode\n");
 
 module_param(p3i_live_borders, bool, 0644);
+module_param(p3i_fel_borders, bool, 0644);
+MODULE_PARM_DESC(p3i_fel_borders, "Enable the experimental G12B Dolby Vision FEL base-layer border tap");
 module_param(p3i_frame_l5_capable, bool, 0444);
 MODULE_PARM_DESC(p3i_live_borders, "Opt in to G12B HEVC live border detection on decoder open");
 module_param_cb(p3i_active_area, &p3i_active_area_ops, NULL, 0444);

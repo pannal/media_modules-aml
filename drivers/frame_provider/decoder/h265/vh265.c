@@ -160,6 +160,7 @@ static int vh265_vf_states(struct vframe_states *states, void *);
 static struct vframe_s *vh265_vf_peek(void *);
 static struct vframe_s *vh265_vf_get(void *);
 static void vh265_vf_put(struct vframe_s *, void *);
+static void p3i_clear_frame_l5(struct hevc_state_s *hevc);
 static int vh265_event_cb(int type, void *data, void *private_data);
 
 static int vh265_stop(struct hevc_state_s *hevc);
@@ -2145,6 +2146,7 @@ struct hevc_state_s {
 	u8 p3i_border_scale; /* zero when the private tap is unavailable */
 	unsigned long p3i_border_next;
 	bool p3i_frame_l5;
+	struct provider_active_area_req_s p3i_last_frame_area;
 	struct provider_active_area_req_s p3i_frame_area[VF_POOL_SIZE];
 	u32 performance_profile;
 	struct vdec_info *gvs;
@@ -4721,6 +4723,8 @@ static struct PIC_s *output_pic(struct hevc_state_s *hevc,
 		pic_display = NULL;
 		hevc->first_pic_flag = 2;
 	}
+	if (pic_display && pic_display->error_mark)
+		p3i_clear_frame_l5(hevc);
 	return pic_display;
 }
 
@@ -10278,6 +10282,39 @@ static void p3i_store_sample(struct p3i_border_sample *stored,
 	}
 }
 
+static void p3i_clear_frame_l5(struct hevc_state_s *hevc)
+{
+	unsigned long flags;
+
+	if (!hevc->p3i_frame_l5)
+		return;
+	spin_lock_irqsave(&p3i_border_lock, flags);
+	hevc->p3i_last_frame_area.valid = false;
+	spin_unlock_irqrestore(&p3i_border_lock, flags);
+}
+
+/* Called in picture output order and under p3i_border_lock. */
+static void p3i_publish_frame_l5(struct hevc_state_s *hevc, const struct vframe_s *vf,
+				 int slot, bool supported, bool confirmed,
+				 const unsigned int *offset)
+{
+	struct provider_active_area_req_s *last = &hevc->p3i_last_frame_area;
+	struct provider_active_area_req_s *area = &hevc->p3i_frame_area[slot];
+
+	if (!supported)
+		last->valid = false;
+	else if (confirmed)
+		*last = (struct provider_active_area_req_s) {
+			.valid = true,
+			.top = offset[0], .bottom = offset[1],
+			.left = offset[2], .right = offset[3],
+		};
+
+	/* Even when the measurement was held, Dolby queries the current frame. */
+	*area = *last;
+	area->vf = vf;
+}
+
 static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 				 const struct vframe_s *vf)
 {
@@ -10303,6 +10340,7 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 	unsigned int y, x;
 	int slot = hevc->p3i_frame_l5 ? p3i_frame_slot(hevc, vf) : -1;
 	bool publish_latest = !time_before(now, hevc->p3i_border_next);
+	bool frame_supported = false;
 	bool frame_valid = false;
 	int i;
 
@@ -10313,8 +10351,10 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 	    irqs_disabled() || vdec_secure(hw_to_vdec(hevc)) ||
 	    hevc->enable_fence || pic->pic_struct ||
 	    pic->error_mark || !pic->output_ready ||
-	    (get_dbg_flag(hevc) & H265_DEBUG_DISPLAY_CUR_FRAME))
+	    (get_dbg_flag(hevc) & H265_DEBUG_DISPLAY_CUR_FRAME)) {
+		p3i_clear_frame_l5(hevc);
 		return;
+	}
 
 	if (publish_latest)
 		hevc->p3i_border_next = now + max_t(unsigned long, 1, HZ / 8);
@@ -10325,6 +10365,9 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 	if (!luma)
 		goto publish;
 
+	frame_supported = slot >= 0 && pic->show_frame &&
+		vf->width == 3840 && vf->height == 2160 &&
+		!hevc->dv_duallayer && !vf->discard_dv_data;
 	codec_mm_dma_flush((void *)luma, stride * height, DMA_FROM_DEVICE);
 	for (y = height / 4; y < 3 * height / 4; y += 32)
 		for (x = width / 4; x < 3 * width / 4; x += 32)
@@ -10356,8 +10399,7 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 	/* L5 affects the sink. Demand a clear boundary on both sides and
 	 * keep a sample's worth of margin inside the measured black area.
 	 */
-	if (slot >= 0 && vf->width == 3840 && vf->height == 2160 &&
-	    !hevc->dv_duallayer && !vf->discard_dv_data &&
+	if (frame_supported &&
 	    abs((int)border[0] - (int)border[1]) <= 1 &&
 	    abs((int)border[2] - (int)border[3]) <= 1) {
 		frame_valid = true;
@@ -10379,16 +10421,8 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 	}
 publish:
 	spin_lock_irqsave(&p3i_border_lock, flags);
-	if (frame_valid) {
-		struct provider_active_area_req_s *area = &hevc->p3i_frame_area[slot];
-
-		area->vf = vf;
-		area->top = offset[0];
-		area->bottom = offset[1];
-		area->left = offset[2];
-		area->right = offset[3];
-		area->valid = true;
-	}
+	if (slot >= 0)
+		p3i_publish_frame_l5(hevc, vf, slot, frame_supported, frame_valid, offset);
 	if (publish_latest && hevc->p3i_border_token && id < ARRAY_SIZE(p3i_border_sessions) &&
 	    p3i_border_sessions[id].token == hevc->p3i_border_token &&
 	    p3i_border_sessions[id].status == 'Y')
@@ -10404,6 +10438,7 @@ static void p3i_reset_borders(struct hevc_state_s *hevc, bool retire)
 	unsigned long flags;
 
 	spin_lock_irqsave(&p3i_border_lock, flags);
+	hevc->p3i_last_frame_area.valid = false;
 	memset(hevc->p3i_frame_area, 0, sizeof(hevc->p3i_frame_area));
 	if (p3i_border_owner == hevc->p3i_border_owner) {
 		p3i_border_sample.valid = false;
@@ -10793,6 +10828,8 @@ static int post_video_frame(struct vdec_s *vdec, struct PIC_s *pic)
 				 !hevc->dv_duallayer && !vf->discard_dv_data)) ? 'Y' : 'N', false);
 		if (hevc->p3i_border_scale && pic->double_write_mode && !display_dw)
 			p3i_measure_borders(hevc, pic, vf);
+		else
+			p3i_clear_frame_l5(hevc);
 #ifdef HEVC_PIC_STRUCT_SUPPORT
 		if (pic->pic_struct == 3 || pic->pic_struct == 4) {
 			struct vframe_s *vf2;
@@ -11332,6 +11369,7 @@ static int hevc_recover(struct hevc_state_s *hevc)
 		mutex_unlock(&vh265_mutex);
 		return ret;
 	}
+	p3i_clear_frame_l5(hevc);
 	amhevc_stop();
 	msleep(20);
 	ret = 0;

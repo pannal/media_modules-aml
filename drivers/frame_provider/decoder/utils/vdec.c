@@ -3967,6 +3967,15 @@ void vdec_reset_core(struct vdec_s *vdec)
 	WRITE_VREG(DOS_SW_RESET0, (1<<3)|(1<<4)|(1<<5)|(1<<7)|(1<<8)|(1<<9));
 	WRITE_VREG(DOS_SW_RESET0, 0);
 
+	/*
+	 * G12B: like vdec_enable_DMC(), reset the VDEC DMC pipeline while its
+	 * requests are gated, before re-enabling them. A single-mode decoder
+	 * (e.g. VC1) released by vdec_disable_DMC() is gated with DDR traffic
+	 * in flight; re-enabling here without this reset can hang the bus.
+	 */
+	if (get_cpu_type() == AM_MESON_CPU_MAJOR_ID_G12B)
+		WRITE_RESET_REG(RESET7_REGISTER, 1 << 15);
+
 	spin_lock_irqsave(&vdec_spin_lock, flags);
 	codec_dmcbus_write(DMC_REQ_CTRL,
 		codec_dmcbus_read(DMC_REQ_CTRL) | mask);

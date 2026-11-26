@@ -10093,6 +10093,8 @@ static inline void hevc_update_gvs(struct hevc_state_s *hevc, struct PIC_s *pic)
 		hevc->gvs->ratio_control = hevc->ratio_control;
 }
 
+#define P3I_BORDER_BLACK_MAX 22
+
 /* Inspect the middle half of each line so bars on the other axis do not
  * bias the vote. Allow isolated noise in the black area.
  */
@@ -10105,7 +10107,7 @@ static bool p3i_black_line(const u8 *luma, unsigned int offset,
 	for (i = 1; i <= 16; i++) {
 		unsigned int pos = length / 4 + (length / 2) * i / 17;
 
-		if (luma[offset + pos * step] > 22 && ++light > 1)
+		if (luma[offset + pos * step] > P3I_BORDER_BLACK_MAX && ++light > 1)
 			return false;
 	}
 	return true;
@@ -10130,30 +10132,96 @@ static unsigned int p3i_measure_edge(const u8 *luma,
 	return count;
 }
 
-/* A dark scene can resemble a one-sided bar. For unequal pairs, require
- * a sustained luma step across half the sampled positions on each bar.
- */
+static bool p3i_edge_contrast(const u8 *boundary, int direction,
+			      unsigned int count)
+{
+	u8 dark = 0, light = 255;
+	int j;
+
+	for (j = 1; j <= min(count, 3U); j++)
+		dark = max(dark, boundary[-j * direction]);
+	for (j = 1; j <= 3; j++)
+		light = min(light, boundary[j * direction]);
+	return (int)light - dark >= 10;
+}
+
+/* Unequal pairs require a sustained luma step across half the center probes. */
 static bool p3i_asymmetric_edge(const u8 *luma, const struct p3i_border_edge *edge,
 				 unsigned int count)
 {
-	int start, pos, i, j;
+	int start, pos, i;
 	unsigned int contrast = 0;
 
 	if (!count)
 		return true;
 	start = edge->start + (int)count * edge->direction;
 	for (i = 1; i <= 16; i++) {
-		u8 dark = 0, light = 255;
-
 		pos = start + (edge->length / 4 + (edge->length / 2) * i / 17) * edge->step;
-		for (j = 1; j <= min(count, 3U); j++)
-			dark = max(dark, luma[pos - j * edge->direction]);
-		for (j = 1; j <= 3; j++)
-			light = min(light, luma[pos + j * edge->direction]);
-		if ((int)light - dark >= 10 && ++contrast >= 8)
+		if (p3i_edge_contrast(luma + pos, edge->direction, count) && ++contrast >= 8)
 			return true;
 	}
 	return false;
+}
+
+/* A dark foreground can pass both center tests. For a one-sided matte,
+ * check the outer fifth at each end of the span between perpendicular bars.
+ */
+static bool p3i_one_sided_edge(const u8 *luma, const struct p3i_border_edge *edge,
+			       unsigned int count, unsigned int leading, unsigned int trailing)
+{
+	unsigned int span = edge->length - leading - trailing;
+	int direction = edge->direction;
+	int side, i;
+
+	for (side = 0; side < 2; side++) {
+		unsigned int steps = 0;
+		bool previous_bright = false;
+
+		for (i = 1; i <= 4; i++) {
+			unsigned int inset = span * i / 20;
+			unsigned int pos = leading + (side ? span - 1 - inset : inset);
+			const u8 *outer = luma + edge->start + pos * edge->step;
+			bool bright = outer[(int)(count / 4) * direction] > P3I_BORDER_BLACK_MAX &&
+				outer[(int)(3 * count / 4) * direction] > P3I_BORDER_BLACK_MAX;
+
+			/* Two adjacent probes with picture detail inside the proposed band. */
+			if (bright && previous_bright)
+				return false;
+			previous_bright = bright;
+			if (p3i_edge_contrast(outer + (int)count * direction, direction, count))
+				steps++;
+		}
+		if (steps < 2)
+			return false;
+	}
+	return true;
+}
+
+static bool p3i_measure_edges(const u8 *luma, const struct p3i_border_edge edges[4],
+			      unsigned int border[4])
+{
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		border[i] = p3i_measure_edge(luma, &edges[i]);
+		if (border[i] > edges[i].depth / 3)
+			return false;
+	}
+	for (i = 0; i < 4; i++) {
+		unsigned int opposite = border[i ^ 1];
+		unsigned int across = i < 2 ? 2 : 0;
+
+		if (abs((int)border[i] - (int)opposite) <= 1)
+			continue;
+		if (!p3i_asymmetric_edge(luma, &edges[i], border[i]))
+			return false;
+		/* The opposite edge can contain a single cell of raster noise. */
+		if (border[i] > 1 && opposite <= 1 &&
+		    !p3i_one_sided_edge(luma, &edges[i], border[i],
+					border[across], border[across + 1]))
+			return false;
+	}
+	return true;
 }
 
 /* Match Kodi's common ratios, in thousandths. Refine the combined
@@ -10380,15 +10448,8 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 	if (sample.peak < 40)
 		goto publish;
 
-	for (i = 0; i < ARRAY_SIZE(edges); i++) {
-		border[i] = p3i_measure_edge(luma, &edges[i]);
-		if (border[i] > edges[i].depth / 3)
-			goto publish;
-	}
-	for (i = 0; i < ARRAY_SIZE(edges); i++)
-		if (abs((int)border[i] - (int)border[i ^ 1]) > 1 &&
-		    !p3i_asymmetric_edge(luma, &edges[i], border[i]))
-			goto publish;
+	if (!p3i_measure_edges(luma, edges, border))
+		goto publish;
 
 	for (i = 0; i < ARRAY_SIZE(edges); i++)
 		offset[i] = scale * border[i];
